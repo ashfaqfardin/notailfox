@@ -2,18 +2,36 @@
   "views": [
     "lex"
   ],
+  "stage": "+ label propagation",
   "params": {
-    "wb": 1.0,
+    "wb": 0.7,
     "a": [
       1.0
     ],
     "t": 0.525,
-    "guard": false
+    "guard": false,
+    "kt": {
+      "lex": [
+        20,
+        0.05
+      ]
+    },
+    "off": [
+      0.5,
+      0.0,
+      0.0
+    ],
+    "beta": 0.0
   },
-  "cv_defense": 0.6820384182966444,
-  "cv_sd": 0.020285529461421144,
+  "cv": {
+    "base (fixed k, tau)": 0.6820384182966444,
+    "+ k, tau per view": 0.6766755040682642,
+    "+ class biases": 0.6918523342816977,
+    "+ label propagation": 0.6923554704651328
+  },
   "ood_cut": 0.1913817673921585,
   "ood_view": "lex",
+  "graph_view": "lex",
   "phase": "devtest",
   "args": {
     "mode": "predict",
@@ -23,10 +41,17 @@
     "cache_dir": "D:\\BanglaNLP\\TrainingFree Pipeline\\cache",
     "views": "auto",
     "k": 25,
+    "k_max": 100,
     "lex_dim": 16384,
     "tau_lex": 0.05,
     "tau_dense": 0.02,
     "tau_llm": 0.05,
+    "no_knn_tuning": false,
+    "no_bias": false,
+    "no_propagation": false,
+    "graph_view": "auto",
+    "graph_k": 10,
+    "force_beta": null,
     "dense_model": "Qwen/Qwen3-Embedding-0.6B",
     "dense_instruction": "Identify the harmful intent and risk level of this user request",
     "no_instruction": false,
@@ -49,5 +74,5 @@
     "seed": 42,
     "max_params": 7000000000.0
   },
-  "created": "2026-11-10 02:36:39"
+  "created": "2026-11-10 14:57:31"
 }

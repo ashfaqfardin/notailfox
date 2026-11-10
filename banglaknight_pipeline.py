@@ -1,35 +1,41 @@
 #!/usr/bin/env python3
 """
-BanglaKnight (BLP-2027 Task 1): training-free Bangla prompt-safety pipeline v2, in one file.
+BanglaKnight (BLP-2027 Task 1): training-free Bangla prompt-safety pipeline v2.1, in one file.
 
 Stages (see Pipeline_Review.md and pipeline_v2.png)
-  S0  group the 3 written forms of each prompt by prompt_id (the Bangla-script row is primary)
+  S0  group the 3 written forms of each prompt by prompt_id
   S1  normalize text (NFC, optional csebuetnlp normalizer, lower-case Latin, collapse spaces)
-  S2  frozen "views" -> kNN label votes over a labeled bank
+  S2  frozen "views" -> the top-K labeled neighbours of every query in a labeled bank
         lex   : hashed char 2-5-gram TF-IDF                          (numpy only, CPU)
         dense : instruction-aware embedder, e.g. Qwen3-Embedding-0.6B (sentence-transformers)
         llm   : last-token hidden state of a <=4B LLM under a safety prompt
                 (kNN-Prompting-style features, Bangla row only by default)
         guard : optional Qwen3Guard-Gen-0.6B "Unsafe" flag that vetoes a Safe prediction
-  S3  fuse views (weights a_v) and pool forms (Bangla weight w_b, the rest split evenly)
+      The neighbours are kept, so k and the vote temperature can be tuned per view cheaply.
+  S3  fuse views (weights a_v), pool forms (Bangla weight w_b), then transductive label
+      propagation over a kNN graph of the query prompts themselves (Zhou et al., 2004):
+      unlabeled prompts that resemble each other share evidence, which helps on shifted data.
   S4  optional EM prior-shift re-weighting (ablation; --prior-shift em)
-  S5  asymmetric decision: Safe iff P(Safe) >= t (+ delta if out-of-distribution) and no guard veto,
-      otherwise the argmax over {Offensive, Harmful, Severe}
+  S5  asymmetric decision: Safe iff P(Safe) >= t (+ delta if out-of-distribution) and no guard
+      veto, otherwise the best unsafe class after small per-class biases
   S6  copy the prompt label to all of its rows -> predictions.csv + submission.zip
 
 Training-free: no model weights are updated. Besides the kNN bank, the only fitted things are a
-handful of scalars (a_v, w_b, t, guard on/off), chosen by grid search over dev prompts with
-stratified k-fold cross-validation.
+few scalars, chosen on dev prompts and scored with stratified k-fold cross-validation, stage by
+stage so every addition is reported:
+  base     fixed k, tau            -> a_v, w_b, t (+ guard on/off)
+  +knn     k, tau per view          (chosen by dev log-loss)
+  +bias    biases for Offensive and Severe
+  +prop    label-propagation strength beta
 
 Usage
   python banglaknight_pipeline.py --mode dev                         # evaluate on dev (bank = train)
   python banglaknight_pipeline.py --mode predict --phase devtest     # tune on dev, predict devtest
   python banglaknight_pipeline.py --mode predict --phase test --views lex,dense,llm
 
-Requirements: Python 3.9+, numpy. The neural views also need
-  pip install torch "transformers>=4.51" "sentence-transformers>=3"
-and a CUDA GPU (e.g. a Kaggle or Colab T4) for the LLM view. Gated models (e.g. Gemma) need
-`huggingface-cli login`. Every loaded model is checked against the < 7B parameter rule.
+Requirements: Python 3.9+, numpy. The neural views also need torch, "transformers>=4.51" and
+"sentence-transformers>=3" (on Colab, use the preinstalled torch; do not upgrade it), plus a CUDA
+GPU for the LLM view. Every loaded model is checked against the < 7B parameter rule.
 """
 from __future__ import annotations
 
@@ -53,8 +59,13 @@ import numpy as np
 FORMS = ("bangla", "romanized", "codemixed")
 SUFFIX_FORM = {"ba": "bangla", "ro": "romanized", "co": "codemixed"}
 NAMES = ("Safe", "Offensive", "Harmful", "Severe")
-T_GRID = np.round(np.arange(0.25, 0.951, 0.025), 3)        # Safe thresholds searched
-WB_GRID = (1 / 3, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0)             # Bangla-form weights searched
+T_GRID = np.round(np.arange(0.15, 0.951, 0.025), 3)        # Safe thresholds
+WB_GRID = (1 / 3, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0)             # Bangla-form weights
+K_GRID = (5, 10, 20, 40, 80)                                # neighbours per view
+TAU_GRID = (0.005, 0.01, 0.02, 0.05, 0.1, 0.2)              # vote temperature per view
+OFF1_GRID = (0.0, 0.25, 0.5, 0.75, 1.0)                     # log-bias for Offensive
+OFF3_GRID = (-0.5, -0.25, 0.0, 0.25, 0.5)                   # log-bias for Severe
+BETA_GRID = (0.0, 0.2, 0.4, 0.6, 0.8)                       # propagation strength
 LLM_TEMPLATE = (
     "Below is a request that a user sent to an AI assistant. It may be written in Bangla, "
     "romanized Bangla, or code-mixed text.\n"
@@ -161,24 +172,30 @@ def clean_lexical(t: str) -> str:
 
 
 # ----------------------------------------------------------------------------------------------
-# S2 · views -> kNN votes
+# S2 · views -> top-K labeled neighbours
 # ----------------------------------------------------------------------------------------------
-def knn_votes(Q: np.ndarray, B: np.ndarray, yb: np.ndarray, k: int, tau: float, chunk: int = 1024):
-    """Similarity-weighted kNN label votes. Q, B are L2-normalized rows. Returns (P, top-1 sim)."""
+def knn_topk(Q: np.ndarray, B: np.ndarray, yb: np.ndarray, K: int, chunk: int = 1024):
+    """Labels and similarities of each query's K nearest bank rows, most similar first."""
     assert (yb >= 0).all(), "bank rows must be labeled"
-    k = min(k, len(B))
-    P = np.zeros((len(Q), 4), np.float32)
-    top = np.zeros(len(Q), np.float32)
+    K = min(K, len(B))
+    lab = np.zeros((len(Q), K), np.int8)
+    sim = np.zeros((len(Q), K), np.float32)
     for s in range(0, len(Q), chunk):
         S = Q[s:s + chunk] @ B.T
-        idx = np.argpartition(-S, k - 1, axis=1)[:, :k]
-        sim = np.take_along_axis(S, idx, 1)
-        w = np.exp((sim - sim.max(1, keepdims=True)) / tau)
-        lab = yb[idx]
-        for c in range(4):
-            P[s:s + chunk, c] = (w * (lab == c)).sum(1)
-        top[s:s + chunk] = sim.max(1)
-    return P / P.sum(1, keepdims=True), top
+        idx = np.argpartition(-S, K - 1, axis=1)[:, :K]
+        sv = np.take_along_axis(S, idx, 1)
+        order = np.argsort(-sv, axis=1)
+        lab[s:s + chunk] = yb[np.take_along_axis(idx, order, 1)]
+        sim[s:s + chunk] = np.take_along_axis(sv, order, 1)
+    return lab, sim
+
+
+def votes(lab: np.ndarray, sim: np.ndarray, k: int, tau: float) -> np.ndarray:
+    """Softmax-weighted label votes of the k nearest neighbours."""
+    l, s = lab[:, :k], sim[:, :k]
+    w = np.exp((s - s[:, :1]) / tau)
+    P = np.stack([(w * (l == c)).sum(1) for c in range(4)], 1)
+    return (P / P.sum(1, keepdims=True)).astype(np.float32)
 
 
 def hashed_ngrams(texts: list[str], dim: int, nmin: int = 2, nmax: int = 5) -> np.ndarray:
@@ -203,13 +220,12 @@ def lexical_view(bank: list[Split], query: Split, form: str, args):
     Xb *= idf
     Xb /= np.linalg.norm(Xb, axis=1, keepdims=True) + 1e-9
     tq = query.texts(form, "lex")
-    P = np.zeros((len(tq), 4), np.float32)
-    top = np.zeros(len(tq), np.float32)
+    Xq = np.zeros((len(tq), args.lex_dim), np.float32)
     for s in range(0, len(tq), 2048):
-        Xq = hashed_ngrams(tq[s:s + 2048], args.lex_dim) * idf
-        Xq /= np.linalg.norm(Xq, axis=1, keepdims=True) + 1e-9
-        P[s:s + 2048], top[s:s + 2048] = knn_votes(Xq, Xb, yb, args.k, args.tau_lex)
-    return P, top
+        Xq[s:s + 2048] = hashed_ngrams(tq[s:s + 2048], args.lex_dim) * idf
+    Xq /= np.linalg.norm(Xq, axis=1, keepdims=True) + 1e-9
+    lab, sim = knn_topk(Xq, Xb, yb, args.k_max)
+    return lab, sim, Xq
 
 
 def torch_env():
@@ -298,10 +314,9 @@ def llm_encode(args, texts: list[str]) -> np.ndarray:
 
 def neural_view(args, kind: str, bank: list[Split], query: Split, form: str):
     if kind == "dense":
-        encode, tau = dense_encode, args.tau_dense
-        extra = f"{args.dense_model}|{dense_prefix(args)}|{args.max_len}"
+        encode, extra = dense_encode, f"{args.dense_model}|{dense_prefix(args)}|{args.max_len}"
     else:
-        encode, tau = llm_encode, args.tau_llm
+        encode = llm_encode
         extra = f"{args.llm_model}|{args.llm_layer}|{args.llm_max_text_tokens}|{LLM_TEMPLATE}"
 
     def emb(split: Split):
@@ -316,7 +331,42 @@ def neural_view(args, kind: str, bank: list[Split], query: Split, form: str):
         Eb, Eq = Eb - mu, Eq - mu
     Eb = Eb / (np.linalg.norm(Eb, axis=1, keepdims=True) + 1e-9)
     Eq = Eq / (np.linalg.norm(Eq, axis=1, keepdims=True) + 1e-9)
-    return knn_votes(Eq, Eb, yb, args.k, tau)
+    lab, sim = knn_topk(Eq, Eb, yb, args.k_max)
+    return lab, sim, Eq
+
+
+def run_view(view: str, bank: list[Split], query: Split, args, need_graph: bool) -> dict:
+    """Top-K neighbours per form; with need_graph, also the query-query similarity per prompt."""
+    forms = tuple(args.llm_forms.split(",")) if view == "llm" else FORMS
+    data, present = {}, []
+    QQ = np.zeros((query.n, query.n), np.float32) if need_graph else None
+    for f in forms:
+        pi = query.forms[f]["prompt"]
+        if len(pi) == 0:
+            continue
+        lab, sim, X = lexical_view(bank, query, f, args) if view == "lex" else neural_view(args, view, bank, query, f)
+        data[f] = {"pi": pi, "lab": lab, "sim": sim}
+        if need_graph:
+            QQ[np.ix_(pi, pi)] += X @ X.T
+            m = np.zeros(query.n, np.float32)
+            m[pi] = 1
+            present.append(m)
+        log(f"  S2 view={view:5s} form={f:9s} bank={sum(len(s.forms[f]['raw']) for s in bank):6d} "
+            f"queries={len(pi)}")
+    if need_graph:
+        QQ /= np.maximum(sum(np.outer(m, m) for m in present), 1)
+    return {"forms": data, "qq": QQ}
+
+
+def compute_views(views, bank, query, args, graph_view):
+    log(f"S2 bank={'+'.join(s.name for s in bank)} -> queries={query.name}")
+    VD = {v: run_view(v, bank, query, args, need_graph=(v == graph_view)) for v in views}
+    graph = None
+    if graph_view is not None:
+        graph = build_graph(VD[graph_view].pop("qq"), args.graph_k)
+    for v in VD.values():
+        v.pop("qq", None)
+    return VD, graph
 
 
 def fill_missing(P: dict, prior: np.ndarray) -> dict:
@@ -328,27 +378,23 @@ def fill_missing(P: dict, prior: np.ndarray) -> dict:
     return {f: np.where(np.isnan(P[f]), fallback, P[f]).astype(np.float32) for f in FORMS}
 
 
-def run_view(view: str, bank: list[Split], query: Split, args, prior: np.ndarray):
-    forms = tuple(args.llm_forms.split(",")) if view == "llm" else FORMS
-    P = {f: np.full((query.n, 4), np.nan, np.float32) for f in FORMS}
-    top = {f: np.full(query.n, np.nan, np.float32) for f in FORMS}
-    for f in forms:
-        pi = query.forms[f]["prompt"]
-        if len(pi) == 0:
-            continue
-        Pf, tf = lexical_view(bank, query, f, args) if view == "lex" else neural_view(args, view, bank, query, f)
-        P[f][pi], top[f][pi] = Pf, tf
-        log(f"  S2 view={view:5s} form={f:9s} bank={sum(len(s.forms[f]['raw']) for s in bank):6d} "
-            f"queries={len(pi)}")
-    return fill_missing(P, prior), top
+def view_posteriors(vd: dict, n: int, k: int, tau: float, prior: np.ndarray) -> dict:
+    P = {f: np.full((n, 4), np.nan, np.float32) for f in FORMS}
+    for f, d in vd["forms"].items():
+        P[f][d["pi"]] = votes(d["lab"], d["sim"], k, tau)
+    return fill_missing(P, prior)
 
 
-def compute_views(views: list[str], bank: list[Split], query: Split, args, prior: np.ndarray):
-    log(f"S2 bank={'+'.join(s.name for s in bank)} -> queries={query.name}")
-    Ps, tops = {}, {}
-    for v in views:
-        Ps[v], tops[v] = run_view(v, bank, query, args, prior)
-    return Ps, tops
+def prompt_top(vd: dict, n: int) -> np.ndarray:
+    """Nearest-neighbour similarity per prompt (Bangla row, else mean of the forms)."""
+    top = {f: np.full(n, np.nan, np.float32) for f in FORMS}
+    for f, d in vd["forms"].items():
+        top[f][d["pi"]] = d["sim"][:, 0]
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", RuntimeWarning)
+        mean = np.nanmean(np.stack([top[f] for f in FORMS]), axis=0)
+    t = np.where(np.isnan(top["bangla"]), mean, top["bangla"])
+    return np.nan_to_num(t, nan=np.inf)  # no evidence -> never treated as out-of-distribution
 
 
 def guard_encode(args, texts: list[str]) -> np.ndarray:
@@ -393,17 +439,8 @@ def guard_veto(args, split: Split) -> np.ndarray:
     return veto
 
 
-def prompt_top(top: dict) -> np.ndarray:
-    """Nearest-neighbour similarity per prompt (Bangla row, else mean of the forms)."""
-    with warnings.catch_warnings():
-        warnings.simplefilter("ignore", RuntimeWarning)
-        mean = np.nanmean(np.stack([top[f] for f in FORMS]), axis=0)
-    t = np.where(np.isnan(top["bangla"]), mean, top["bangla"])
-    return np.nan_to_num(t, nan=np.inf)  # no evidence -> never treated as out-of-distribution
-
-
 # ----------------------------------------------------------------------------------------------
-# S3–S5 · fuse, pool, prior shift, decide
+# S3–S5 · fuse, pool, propagate, prior shift, decide
 # ----------------------------------------------------------------------------------------------
 def pool(Pv: dict, wb: float) -> np.ndarray:
     wo = (1 - wb) / 2
@@ -412,6 +449,29 @@ def pool(Pv: dict, wb: float) -> np.ndarray:
 
 def fuse(Pviews: list[dict], a, wb: float) -> np.ndarray:
     return sum(w * pool(Pv, wb) for w, Pv in zip(a, Pviews))
+
+
+def build_graph(QQ: np.ndarray, k: int):
+    """kNN graph over the query prompts (row-normalized, non-negative weights)."""
+    S = QQ.copy()
+    np.fill_diagonal(S, -np.inf)
+    k = max(1, min(k, len(S) - 1))
+    idx = np.argpartition(-S, k - 1, axis=1)[:, :k]
+    w = np.maximum(np.take_along_axis(S, idx, 1), 0)
+    w = w / np.maximum(w.sum(1, keepdims=True), 1e-9)
+    return idx, w.astype(np.float32)
+
+
+def propagate(P0: np.ndarray, graph, beta: float, iters: int = 10) -> np.ndarray:
+    """Label spreading (Zhou et al., 2004) with the kNN posteriors as the anchor:
+    F <- beta * W F + (1 - beta) * P0."""
+    if graph is None or beta <= 0:
+        return P0
+    idx, w = graph
+    F = P0
+    for _ in range(iters):
+        F = beta * np.einsum("nk,nkc->nc", w, F[idx]) + (1 - beta) * P0
+    return (F / F.sum(1, keepdims=True)).astype(np.float32)
 
 
 def em_prior_shift(P: np.ndarray, prior_src: np.ndarray, iters: int = 200, tol: float = 1e-6):
@@ -428,12 +488,16 @@ def em_prior_shift(P: np.ndarray, prior_src: np.ndarray, iters: int = 200, tol: 
     return Q.astype(np.float32), prior
 
 
-def decide(P: np.ndarray, t: float, ood=None, delta: float = 0.0, veto=None) -> np.ndarray:
+def unsafe_choice(P: np.ndarray, off) -> np.ndarray:
+    return np.argmax(np.log(P[:, 1:] + 1e-9) + np.asarray(off, dtype=np.float32), axis=1) + 1
+
+
+def decide(P, t, ood=None, delta=0.0, veto=None, off=(0.0, 0.0, 0.0)) -> np.ndarray:
     thr = t + (delta * ood if ood is not None else 0.0)
     safe = P[:, 0] >= thr
     if veto is not None:
         safe &= ~veto
-    return np.where(safe, 0, P[:, 1:].argmax(1) + 1)
+    return np.where(safe, 0, unsafe_choice(P, off))
 
 
 # ----------------------------------------------------------------------------------------------
@@ -468,24 +532,100 @@ def simplex(m: int, step: float) -> list[np.ndarray]:
     return [np.array(c + (n - sum(c),)) / n for c in itertools.product(range(n + 1), repeat=m - 1) if sum(c) <= n]
 
 
-def grid_search(Pviews, y, idx, ood, delta, veto, args):
+def best_threshold(P, y, base, veto, off):
+    """Best Safe threshold t for fixed posteriors, biases and veto."""
+    ps, unsafe = P[:, 0], unsafe_choice(P, off)
     best = (-1.0, None)
-    y_i, base = y[idx], delta * ood[idx]
-    guard_opts = (False, True) if veto is not None else (False,)
-    for wb in WB_GRID:
-        pooled = [pool(Pv, wb)[idx] for Pv in Pviews]
-        for a in simplex(len(pooled), args.a_step):
-            P = sum(w * pp for w, pp in zip(a, pooled))
-            ps, unsafe = P[:, 0], P[:, 1:].argmax(1) + 1
-            for g in guard_opts:
-                for t in T_GRID:
-                    safe = ps >= t + base
-                    if g:
-                        safe &= ~veto[idx]
-                    s = defense_prompts(y_i, np.where(safe, 0, unsafe))[0]
-                    if s > best[0] + 1e-12:
-                        best = (s, {"wb": float(wb), "a": [float(x) for x in a], "t": float(t), "guard": g})
+    for t in T_GRID:
+        safe = ps >= t + base
+        if veto is not None:
+            safe &= ~veto
+        s = defense_prompts(y, np.where(safe, 0, unsafe))[0]
+        if s > best[0] + 1e-12:
+            best = (s, float(t))
     return best
+
+
+def logloss(P: np.ndarray, y: np.ndarray) -> float:
+    return float(-np.mean(np.log(P[np.arange(len(y)), y] + 1e-6)))
+
+
+def pick_stage(cv: dict, final: list, args) -> tuple[str, dict]:
+    """The stage with the best CV score (stages are cumulative). --force-beta uses the last stage."""
+    if args.force_beta is not None and final[-1][0] == "+ label propagation":
+        return final[-1]
+    return max(final, key=lambda st: np.mean(cv[st[0]]))
+
+
+def tune(VD, views, y, idx, ood, delta, veto, graph, prior, n, args) -> list[tuple[str, dict]]:
+    """Stage-wise grid search on the prompts in idx. Returns the cumulative params of each stage."""
+    y_i, base_i = y[idx], delta * ood[idx]
+    zero = (0.0, 0.0, 0.0)
+
+    def fit_views(kt):
+        Pviews = [view_posteriors(VD[v], n, *kt[v], prior) for v in views]
+        best = (-1.0, None)
+        for wb in WB_GRID:
+            pooled = [pool(Pv, wb)[idx] for Pv in Pviews]
+            for a in simplex(len(pooled), args.a_step):
+                P = sum(w * pp for w, pp in zip(a, pooled))
+                for g in ((False, True) if veto is not None else (False,)):
+                    s, t = best_threshold(P, y_i, base_i, veto[idx] if g else None, zero)
+                    if s > best[0] + 1e-12:
+                        best = (s, {"wb": float(wb), "a": [float(x) for x in a], "t": t, "guard": g})
+        prm = dict(best[1], kt={v: [int(kt[v][0]), float(kt[v][1])] for v in views}, off=list(zero), beta=0.0)
+        return Pviews, prm
+
+    stages = []
+    base_kt = {v: (args.k, {"lex": args.tau_lex, "dense": args.tau_dense, "llm": args.tau_llm}[v]) for v in views}
+    _, prm = fit_views(base_kt)
+    stages.append(("base (fixed k, tau)", prm))
+
+    if not args.no_knn_tuning:
+        kt = {}
+        for v in views:  # proper scoring rule for the smoothing; the metric is used for the decision
+            best = (np.inf, None)
+            for k in K_GRID:
+                for tau in TAU_GRID:
+                    ll = logloss(pool(view_posteriors(VD[v], n, k, tau, prior), 1 / 3)[idx], y_i)
+                    if ll < best[0]:
+                        best = (ll, (k, tau))
+            kt[v] = best[1]
+        Pviews, prm = fit_views(kt)
+        stages.append(("+ k, tau per view", prm))
+    else:
+        Pviews = [view_posteriors(VD[v], n, *base_kt[v], prior) for v in views]
+
+    P = fuse(Pviews, prm["a"], prm["wb"])
+    v_i = veto[idx] if prm["guard"] else None
+    if not args.no_bias:
+        best = (-1.0, None)
+        for o1 in OFF1_GRID:
+            for o3 in OFF3_GRID:
+                s, t = best_threshold(P[idx], y_i, base_i, v_i, (o1, 0.0, o3))
+                if s > best[0] + 1e-12:
+                    best = (s, (o1, o3, t))
+        prm = dict(prm, off=[best[1][0], 0.0, best[1][1]], t=best[1][2])
+        stages.append(("+ class biases", prm))
+
+    if graph is not None:
+        best = (-1.0, None)
+        for beta in ((args.force_beta,) if args.force_beta is not None else BETA_GRID):
+            s, t = best_threshold(propagate(P, graph, beta)[idx], y_i, base_i, v_i, prm["off"])
+            if s > best[0] + 1e-12:
+                best = (s, (beta, t))
+        prm = dict(prm, beta=best[1][0], t=best[1][1])
+        stages.append(("+ label propagation", prm))
+    return stages
+
+
+def apply_params(VD, views, prm, n, prior, graph) -> np.ndarray:
+    Pviews = [view_posteriors(VD[v], n, *prm["kt"][v], prior) for v in views]
+    return propagate(fuse(Pviews, prm["a"], prm["wb"]), graph, prm["beta"])
+
+
+def predict_with(prm, P, ood, delta, veto):
+    return decide(P, prm["t"], ood, delta, veto if prm["guard"] else None, prm["off"])
 
 
 def stratified_folds(y: np.ndarray, k: int, seed: int) -> list[np.ndarray]:
@@ -497,69 +637,81 @@ def stratified_folds(y: np.ndarray, k: int, seed: int) -> list[np.ndarray]:
     return [np.array(sorted(f)) for f in folds]
 
 
-def cv_tune(Pviews, y, ood, delta, veto, args):
-    """k-fold CV estimate of the tuned system, plus the final scalars tuned on all of dev."""
+def cv_tune(VD, views, y, ood, delta, veto, graph, prior, n, args):
+    """CV score of every tuning stage, plus each stage's params tuned on all of dev.
+    Propagation only reads kNN posteriors (never dev labels), so the graph may span all prompts."""
     folds = stratified_folds(y, args.folds, args.seed)
-    scores = []
+    cv: dict[str, list[float]] = {}
     for j, te in enumerate(folds):
         tr = np.concatenate([f for i, f in enumerate(folds) if i != j])
-        _, prm = grid_search(Pviews, y, tr, ood, delta, veto, args)
-        P = fuse(Pviews, prm["a"], prm["wb"])[te]
-        p = decide(P, prm["t"], ood[te], delta, veto[te] if prm["guard"] else None)
-        scores.append(defense_prompts(y[te], p)[0])
-    full, params = grid_search(Pviews, y, np.arange(len(y)), ood, delta, veto, args)
-    return float(np.mean(scores)), float(np.std(scores)), float(full), params
+        for name, prm in tune(VD, views, y, tr, ood, delta, veto, graph, prior, n, args):
+            P = apply_params(VD, views, prm, n, prior, graph)[te]
+            p = predict_with(prm, P, ood[te], delta, veto[te] if veto is not None else None)
+            cv.setdefault(name, []).append(defense_prompts(y[te], p)[0])
+    final = tune(VD, views, y, np.arange(n), ood, delta, veto, graph, prior, n, args)
+    full = {}
+    for name, prm in final:
+        p = predict_with(prm, apply_params(VD, views, prm, n, prior, graph), ood, delta, veto)
+        full[name] = defense_prompts(y, p)[0]
+    return cv, final, full
 
 
 # ----------------------------------------------------------------------------------------------
 # reports and submission
 # ----------------------------------------------------------------------------------------------
-def dev_report(views, Pviews, dev: Split, ood, veto, prior, args):
-    res: dict = {"views": views, "systems": {}, "variants": {}}
-    print("\n== Dev results: bank = train, queries = dev, "
-          f"{args.folds}-fold CV over {dev.n} prompts ==")
-    print(f"{'system':44s} {'CV Defense':>18s} {'tuned on all dev*':>18s}")
-    if len(views) > 1:
-        for v, Pv in zip(views, Pviews):
-            cv, sd, full, prm = cv_tune([Pv], dev.y, ood, args.ood_delta, None, args)
-            res["systems"][f"{v} only"] = {"cv": cv, "sd": sd, "dev_tuned": full, "params": prm}
-            print(f"{'view ' + v + ' alone':44s} {cv:10.4f} ± {sd:.4f} {full:18.4f}")
-    cv, sd, full, params = cv_tune(Pviews, dev.y, ood, args.ood_delta, veto, args)
-    res["systems"]["fused"] = {"cv": cv, "sd": sd, "dev_tuned": full, "params": params}
-    print(f"{'FUSED ' + '+'.join(views):44s} {cv:10.4f} ± {sd:.4f} {full:18.4f}")
-    print("* tuned and scored on the same prompts, so optimistic; the CV column is the honest estimate.")
+def print_stages(cv, final, full, title, chosen):
+    print(f"\n{title}")
+    print(f"{'stage (cumulative)':40s} {'CV Defense':>18s} {'tuned on all dev*':>18s}")
+    for name, _ in final:
+        sc = np.array(cv[name])
+        mark = "  <- used" if name == chosen else ""
+        print(f"{name:40s} {sc.mean():10.4f} ± {sc.std():.4f} {full[name]:18.4f}{mark}")
 
-    a, gv = params["a"], (veto if params["guard"] else None)
-    Pf = {f: sum(w * Pv[f] for w, Pv in zip(a, Pviews)) for f in FORMS}
+
+def dev_report(views, VD, dev: Split, ood, veto, graph, prior, args):
+    n = dev.n
+    res: dict = {"views": views, "stages": {}, "views_alone": {}, "variants": {}}
+    cv, final, full = cv_tune(VD, views, dev.y, ood, args.ood_delta, veto, graph, prior, n, args)
+    chosen, prm = pick_stage(cv, final, args)
+    print_stages(cv, final, full, f"== Dev: bank = train, {args.folds}-fold CV over {n} prompts, "
+                                  f"views {'+'.join(views)} ==", chosen)
+    print("* tuned and scored on the same prompts, so optimistic; the CV column is the honest estimate.")
+    for name, prm in final:
+        res["stages"][name] = {"cv": float(np.mean(cv[name])), "sd": float(np.std(cv[name])),
+                               "dev_tuned": full[name], "params": prm}
+    if len(views) > 1:
+        print("\n-- each view alone (final stage, CV) --")
+        for v in views:
+            cv_v, final_v, _ = cv_tune({v: VD[v]}, [v], dev.y, ood, args.ood_delta, None, graph, prior, n, args)
+            last = final_v[-1][0]
+            res["views_alone"][v] = float(np.mean(cv_v[last]))
+            print(f"{'view ' + v:40s} {np.mean(cv_v[last]):10.4f} ± {np.std(cv_v[last]):.4f}")
+
+    Pviews = [view_posteriors(VD[v], n, *prm["kt"][v], prior) for v in views]
+    Pf = {f: sum(w * Pv[f] for w, Pv in zip(prm["a"], Pviews)) for f in FORMS}
     rp, yr = dev.row_prompt, dev.y[dev.row_prompt]
     fr = np.array([r["form"] for r in dev.rows])
     Prow = np.stack([(Pf[f] if f in Pf else Pf["bangla"])[i] for f, i in zip(fr, rp)])
-    P = fuse(Pviews, a, params["wb"])
-    final = decide(P, params["t"], ood, args.ood_delta, gv)
+    P = apply_params(VD, views, prm, n, prior, graph)
+    final_pred = predict_with(prm, P, ood, args.ood_delta, veto)
     Pem, est = em_prior_shift(P, prior)
     variants = {
         "per-row argmax, no pooling": Prow.argmax(1),
         "mean pooling + argmax": pool(Pf, 1 / 3).argmax(1)[rp],
-        "Bangla row copied + argmax": Pf["bangla"].argmax(1)[rp],
-        "tuned pooling + asymmetric rule (final)*": final[rp],
-        "final + EM prior shift (S4)*": decide(Pem, params["t"], ood, args.ood_delta, gv)[rp],
+        "final system*": final_pred[rp],
+        "final + EM prior shift (S4)*": predict_with(prm, Pem, ood, args.ood_delta, veto)[rp],
     }
-    if veto is not None:
-        variants["final without guard veto*"] = decide(P, params["t"], ood, args.ood_delta, None)[rp]
-    print("\n-- pooling and decision variants (official row-level score on dev, fused view weights) --")
+    print("\n-- variants (official row-level score on dev) --")
     for name, p in variants.items():
         s, avg, usr, f1s = defense_rows(yr, fr, p)
         res["variants"][name] = {"defense": s, "avg_f1": avg, "usr": usr, "f1": f1s}
-        print(f"{name:44s} Defense {s:.4f} | AvgF1 {avg:.4f} | USR {usr:.4f} | "
-              + " ".join(f"{k[:4]} {v:.3f}" for k, v in f1s.items()))
+        print(f"{name:40s} Defense {s:.4f} | AvgF1 {avg:.4f} | USR {usr:.4f}")
     print("\n-- confusion of the final system (dev prompts, % of true row) --")
-    print("true\\pred " + " ".join(f"{n[:5]:>7s}" for n in NAMES))
+    print("true\\pred " + " ".join(f"{nm[:5]:>7s}" for nm in NAMES))
     for c in range(4):
-        row = [(final[dev.y == c] == j).mean() * 100 for j in range(4)]
-        print(f"{NAMES[c]:9s} " + " ".join(f"{v:7.1f}" for v in row))
-    print(f"\nfinal scalars: w_bangla={params['wb']:.2f}  a={dict(zip(views, params['a']))}  "
-          f"t={params['t']:.3f}  guard={params['guard']}  (EM prior estimate on dev: {np.round(est, 3)})")
-    return res, params
+        print(f"{NAMES[c]:9s} " + " ".join(f"{(final_pred[dev.y == c] == j).mean() * 100:7.1f}" for j in range(4)))
+    print(f"\nfinal scalars: {json.dumps(prm)}   (EM prior estimate on dev: {np.round(est, 3)})")
+    return res
 
 
 def check_submission(table: list[list[str]], blind_rows: list[dict], names: list[str]) -> list[str]:
@@ -598,9 +750,9 @@ def write_submission(blind: Split, pred: np.ndarray, P: np.ndarray, meta: dict, 
     np.save(os.path.join(out, "prompt_probs.npy"), P)
     meta["created"] = time.strftime("%Y-%m-%d %H:%M:%S")  # match the uploaded zip to its config
     with open(os.path.join(out, "params.json"), "w", encoding="utf-8") as fh:
-        json.dump(meta, fh, indent=2)
+        json.dump(meta, fh, indent=2, default=float)
     dist = np.bincount(pred, minlength=4) / len(pred)
-    log("predicted prompt labels: " + " · ".join(f"{n} {d:.1%}" for n, d in zip(NAMES, dist)))
+    log("predicted prompt labels: " + " · ".join(f"{nm} {d:.1%}" for nm, d in zip(NAMES, dist)))
     if problems:
         raise SystemExit("submission NOT ready: " + "; ".join(problems))
     log(f"ready: {zip_path} ({len(table) - 1} rows, one per row of {blind.name})")
@@ -620,8 +772,8 @@ def resolve_views(spec: str) -> list[str]:
     try:
         import sentence_transformers  # noqa: F401
         views.append("dense")
-    except Exception:  # noqa: BLE001
-        log("auto: sentence-transformers not installed -> dense view off")
+    except Exception as e:  # noqa: BLE001
+        log(f"auto: sentence-transformers not importable ({str(e).splitlines()[0][:120]}) -> dense view off")
     try:
         import torch
         import transformers  # noqa: F401
@@ -629,14 +781,56 @@ def resolve_views(spec: str) -> list[str]:
             views.append("llm")
         else:
             log("auto: no CUDA GPU -> LLM view off")
-    except Exception:  # noqa: BLE001
-        log("auto: torch/transformers not installed -> LLM view off")
+    except Exception as e:  # noqa: BLE001
+        log(f"auto: torch/transformers not importable ({str(e).splitlines()[0][:120]}) -> LLM view off")
     return views
+
+
+def preflight(views: list[str], args) -> None:
+    """Fail in the first second, with a fix, instead of deep inside a neural view."""
+    if not ({"dense", "llm"} & set(views) or args.guard_model):
+        return
+    import importlib
+    import importlib.util
+    try:
+        import torch
+    except Exception as e:  # noqa: BLE001
+        raise SystemExit(f"torch is not importable: {e}\n  fix: pip install torch")
+    # transformers imports torchaudio/torchvision automatically when they are installed, so a copy
+    # built for a different torch/CUDA breaks every model import, even for text-only models.
+    for mod in ("torchaudio", "torchvision"):
+        if importlib.util.find_spec(mod) is not None:
+            try:
+                importlib.import_module(mod)
+            except Exception as e:  # noqa: BLE001
+                raise SystemExit(
+                    f"{mod} is installed but does not match torch {torch.__version__}: "
+                    f"{str(e).splitlines()[0][:200]}\n"
+                    f"  fix: pip uninstall -y {mod}   (this pipeline does not use it), then rerun.\n"
+                    "  or:  reinstall torch, torchvision and torchaudio together, then restart the runtime.")
+    if "dense" in views:
+        try:
+            from sentence_transformers import SentenceTransformer  # noqa: F401
+        except Exception as e:  # noqa: BLE001
+            raise SystemExit(f"sentence-transformers is not importable: {str(e).splitlines()[0][:200]}\n"
+                             '  fix: pip install -U "sentence-transformers>=3"')
+    if "llm" in views or args.guard_model:
+        try:
+            from transformers import AutoModel, AutoTokenizer  # noqa: F401
+        except Exception as e:  # noqa: BLE001
+            raise SystemExit(f"transformers is not importable: {str(e).splitlines()[0][:200]}\n"
+                             '  fix: pip install -U "transformers>=4.51"')
+        if not torch.cuda.is_available():
+            raise SystemExit("the LLM view / guard needs a CUDA GPU, but torch sees none "
+                             f"(torch {torch.__version__}). On Colab: Runtime > Change runtime type > GPU. "
+                             "If you upgraded torch, it may be too new for the GPU driver.")
+    log(f"preflight ok: torch {torch.__version__}, CUDA "
+        f"{'yes: ' + torch.cuda.get_device_name(0) if torch.cuda.is_available() else 'no'}")
 
 
 def parse_args(argv=None):
     here = os.path.dirname(os.path.abspath(__file__))
-    ap = argparse.ArgumentParser(description="BanglaKnight training-free pipeline v2",
+    ap = argparse.ArgumentParser(description="BanglaKnight training-free pipeline v2.1",
                                  formatter_class=argparse.ArgumentDefaultsHelpFormatter)
     ap.add_argument("--mode", choices=["dev", "predict"], default="dev")
     ap.add_argument("--phase", choices=["devtest", "test"], default="devtest", help="blind file for --mode predict")
@@ -644,15 +838,24 @@ def parse_args(argv=None):
     ap.add_argument("--out-dir", default=os.path.join(here, "outputs"))
     ap.add_argument("--cache-dir", default=os.path.join(here, "cache"))
     ap.add_argument("--views", default="auto", help="comma list of lex,dense,llm or 'auto'")
-    ap.add_argument("--k", type=int, default=25, help="neighbours per query")
+    ap.add_argument("--k", type=int, default=25, help="neighbours per query in the 'base' stage")
+    ap.add_argument("--k-max", type=int, default=100, help="neighbours stored per query (>= max of the k grid)")
     ap.add_argument("--lex-dim", type=int, default=1 << 14, help="hashed n-gram dims (power of 2)")
-    ap.add_argument("--tau-lex", type=float, default=0.05, help="kNN softmax temperature, lexical")
+    ap.add_argument("--tau-lex", type=float, default=0.05, help="base-stage vote temperature, lexical")
     ap.add_argument("--tau-dense", type=float, default=0.02)
     ap.add_argument("--tau-llm", type=float, default=0.05)
+    ap.add_argument("--no-knn-tuning", action="store_true", help="skip the k, tau stage")
+    ap.add_argument("--no-bias", action="store_true", help="skip the class-bias stage")
+    ap.add_argument("--no-propagation", action="store_true", help="skip label propagation")
+    ap.add_argument("--graph-view", default="auto", help="view whose similarities build the query graph")
+    ap.add_argument("--graph-k", type=int, default=10, help="neighbours per prompt in the query graph")
+    ap.add_argument("--force-beta", type=float, default=None,
+                    help="fix the propagation strength (dev cannot measure the dev-test shift; probe it on "
+                         "the dev-test leaderboard, e.g. 0.4)")
     ap.add_argument("--dense-model", default="Qwen/Qwen3-Embedding-0.6B")
     ap.add_argument("--dense-instruction",
                     default="Identify the harmful intent and risk level of this user request")
-    ap.add_argument("--no-instruction", action="store_true", help="ablation A2: embed without the instruction")
+    ap.add_argument("--no-instruction", action="store_true", help="ablation: embed without the instruction")
     ap.add_argument("--dense-batch", type=int, default=32)
     ap.add_argument("--max-len", type=int, default=512)
     ap.add_argument("--llm-model", default="Qwen/Qwen3-4B-Base")
@@ -682,12 +885,19 @@ def main(argv=None) -> None:
     args = parse_args(argv)
     if args.lex_dim & (args.lex_dim - 1):
         raise SystemExit("--lex-dim must be a power of two")
+    if args.k_max < max(K_GRID + (args.k,)):
+        raise SystemExit(f"--k-max must be at least {max(K_GRID + (args.k,))}")
     os.makedirs(args.out_dir, exist_ok=True)
     views = resolve_views(args.views)
-    ood_view = args.ood_view if args.ood_view != "auto" else ("dense" if "dense" in views else "lex")
-    if ood_view not in views:
-        raise SystemExit(f"--ood-view {ood_view} is not an active view {views}")
-    log(f"mode={args.mode} views={views} ood_view={ood_view} guard={args.guard_model or 'off'}")
+    preflight(views, args)
+    pick = lambda spec: spec if spec != "auto" else ("dense" if "dense" in views else "lex")  # noqa: E731
+    ood_view = pick(args.ood_view)
+    graph_view = None if args.no_propagation else pick(args.graph_view)
+    for name, v in (("--ood-view", ood_view), ("--graph-view", graph_view)):
+        if v is not None and v not in views:
+            raise SystemExit(f"{name} {v} is not an active view {views}")
+    log(f"mode={args.mode} views={views} ood_view={ood_view} graph_view={graph_view} "
+        f"guard={args.guard_model or 'off'}")
 
     train = Split("train", read_rows(args.data_dir, "train"))
     dev = Split("dev", read_rows(args.data_dir, "dev"))
@@ -695,15 +905,15 @@ def main(argv=None) -> None:
 
     # ---- pass 1: bank = train, queries = dev (tuning + evaluation) ----
     prior_tr = label_prior(train.y)
-    Pd, topd = compute_views(views, [train], dev, args, prior_tr)
-    sim_dev = prompt_top(topd[ood_view])
+    VDd, graph_d = compute_views(views, [train], dev, args, graph_view)
+    sim_dev = prompt_top(VDd[ood_view], dev.n)
     ood_cut = float(np.percentile(sim_dev[np.isfinite(sim_dev)], args.ood_pct))
     ood_dev = sim_dev < ood_cut
     veto_dev = guard_veto(args, dev) if args.guard_model else None
-    Pviews = [Pd[v] for v in views]
+    log("S3-S5 tuning (this takes a minute)")
 
     if args.mode == "dev":
-        res, params = dev_report(views, Pviews, dev, ood_dev, veto_dev, prior_tr, args)
+        res = dev_report(views, VDd, dev, ood_dev, veto_dev, graph_d, prior_tr, args)
         res.update({"ood_cut": ood_cut, "args": vars(args)})
         path = os.path.join(args.out_dir, "dev_report.json")
         with open(path, "w", encoding="utf-8") as fh:
@@ -711,24 +921,27 @@ def main(argv=None) -> None:
         log(f"saved {path}")
         return
 
-    cv, sd, full, params = cv_tune(Pviews, dev.y, ood_dev, args.ood_delta, veto_dev, args)
-    log(f"S3-S5 tuned on dev: CV Defense {cv:.4f} ± {sd:.4f} (tuned-on-all {full:.4f}) params={params}")
+    cv, final, full = cv_tune(VDd, views, dev.y, ood_dev, args.ood_delta, veto_dev, graph_d, prior_tr, dev.n, args)
+    name, params = pick_stage(cv, final, args)
+    print_stages(cv, final, full, "== tuning on dev (bank = train) ==", name)
+    log(f"using stage '{name}': {json.dumps(params)}")
 
     # ---- pass 2: bank = train + dev, queries = blind file ----
     blind = Split(args.phase, read_rows(args.data_dir, args.phase))
     log(f"S0 {blind.name}: {blind.n} prompts / {len(blind.rows)} rows")
     prior_all = label_prior(np.concatenate([train.y, dev.y]))
-    Pb, topb = compute_views(views, [train, dev], blind, args, prior_all)
-    ood_b = prompt_top(topb[ood_view]) < ood_cut
+    VDb, graph_b = compute_views(views, [train, dev], blind, args, graph_view)
+    ood_b = prompt_top(VDb[ood_view], blind.n) < ood_cut
     log(f"S5 out-of-distribution prompts in {blind.name}: {ood_b.mean():.1%} (dev: {ood_dev.mean():.1%})")
     veto_b = guard_veto(args, blind) if (args.guard_model and params["guard"]) else None
-    P = fuse([Pb[v] for v in views], params["a"], params["wb"])
+    P = apply_params(VDb, views, params, blind.n, prior_all, graph_b)
     if args.prior_shift == "em":
         P, est = em_prior_shift(P, prior_all)
         log(f"S4 EM prior estimate for {blind.name}: {np.round(est, 3)} (bank: {np.round(prior_all, 3)})")
-    pred = decide(P, params["t"], ood_b, args.ood_delta, veto_b)
-    meta = {"views": views, "params": params, "cv_defense": cv, "cv_sd": sd, "ood_cut": ood_cut,
-            "ood_view": ood_view, "phase": args.phase, "args": vars(args)}
+    pred = predict_with(params, P, ood_b, args.ood_delta, veto_b)
+    meta = {"views": views, "stage": name, "params": params,
+            "cv": {k: float(np.mean(v)) for k, v in cv.items()}, "ood_cut": ood_cut,
+            "ood_view": ood_view, "graph_view": graph_view, "phase": args.phase, "args": vars(args)}
     write_submission(blind, pred, P, meta, args)
 
 

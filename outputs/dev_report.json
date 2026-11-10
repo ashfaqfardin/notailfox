@@ -2,8 +2,8 @@
   "views": [
     "lex"
   ],
-  "systems": {
-    "fused": {
+  "stages": {
+    "base (fixed k, tau)": {
       "cv": 0.6820384182966444,
       "sd": 0.020285529461421144,
       "dev_tuned": 0.6864819622137964,
@@ -13,59 +13,137 @@
           1.0
         ],
         "t": 0.525,
-        "guard": false
+        "guard": false,
+        "kt": {
+          "lex": [
+            25,
+            0.05
+          ]
+        },
+        "off": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "beta": 0.0
+      }
+    },
+    "+ k, tau per view": {
+      "cv": 0.6766755040682642,
+      "sd": 0.011753510767547534,
+      "dev_tuned": 0.6825268884549148,
+      "params": {
+        "wb": 0.7,
+        "a": [
+          1.0
+        ],
+        "t": 0.525,
+        "guard": false,
+        "kt": {
+          "lex": [
+            20,
+            0.05
+          ]
+        },
+        "off": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "beta": 0.0
+      }
+    },
+    "+ class biases": {
+      "cv": 0.6918523342816977,
+      "sd": 0.026062072164599298,
+      "dev_tuned": 0.6982780508117111,
+      "params": {
+        "wb": 0.7,
+        "a": [
+          1.0
+        ],
+        "t": 0.525,
+        "guard": false,
+        "kt": {
+          "lex": [
+            20,
+            0.05
+          ]
+        },
+        "off": [
+          0.5,
+          0.0,
+          0.0
+        ],
+        "beta": 0.0
+      }
+    },
+    "+ label propagation": {
+      "cv": 0.6923554704651328,
+      "sd": 0.024889051067459006,
+      "dev_tuned": 0.6982780508117111,
+      "params": {
+        "wb": 0.7,
+        "a": [
+          1.0
+        ],
+        "t": 0.525,
+        "guard": false,
+        "kt": {
+          "lex": [
+            20,
+            0.05
+          ]
+        },
+        "off": [
+          0.5,
+          0.0,
+          0.0
+        ],
+        "beta": 0.0
       }
     }
   },
+  "views_alone": {},
   "variants": {
     "per-row argmax, no pooling": {
-      "defense": 0.6454791971472379,
-      "avg_f1": 0.6823492921329565,
-      "usr": 0.0540340488527017,
+      "defense": 0.6409647109722686,
+      "avg_f1": 0.6788162982938606,
+      "usr": 0.05576116456945472,
       "f1": {
-        "bangla": 0.7037669658682792,
-        "romanized": 0.6926767779059864,
-        "codemixed": 0.6506041326246039
+        "bangla": 0.6975996879945329,
+        "romanized": 0.6922483404902747,
+        "codemixed": 0.646600866396774
       }
     },
     "mean pooling + argmax": {
-      "defense": 0.6719739496660656,
-      "avg_f1": 0.7004913626534371,
-      "usr": 0.04071058475203553,
+      "defense": 0.667207604718978,
+      "avg_f1": 0.6971364841263258,
+      "usr": 0.04293116210214656,
       "f1": {
-        "bangla": 0.7004913626534373,
-        "romanized": 0.7004913626534373,
-        "codemixed": 0.7004913626534373
+        "bangla": 0.6971364841263259,
+        "romanized": 0.6971364841263259,
+        "codemixed": 0.6971364841263259
       }
     },
-    "Bangla row copied + argmax": {
-      "defense": 0.6709488172008464,
-      "avg_f1": 0.7037669658682791,
-      "usr": 0.046632124352331605,
+    "final system*": {
+      "defense": 0.6982780508117111,
+      "avg_f1": 0.708770583506102,
+      "usr": 0.014803849000740192,
       "f1": {
-        "bangla": 0.7037669658682792,
-        "romanized": 0.7037669658682792,
-        "codemixed": 0.7037669658682792
-      }
-    },
-    "tuned pooling + asymmetric rule (final)*": {
-      "defense": 0.6864819622137964,
-      "avg_f1": 0.6973211510908565,
-      "usr": 0.015544041450777202,
-      "f1": {
-        "bangla": 0.6973211510908565,
-        "romanized": 0.6973211510908565,
-        "codemixed": 0.6973211510908565
+        "bangla": 0.708770583506102,
+        "romanized": 0.708770583506102,
+        "codemixed": 0.708770583506102
       }
     },
     "final + EM prior shift (S4)*": {
-      "defense": 0.6522389265448788,
-      "avg_f1": 0.6590686535244064,
-      "usr": 0.010362694300518135,
+      "defense": 0.6717978719824849,
+      "avg_f1": 0.6778184653086908,
+      "usr": 0.008882309400444115,
       "f1": {
-        "bangla": 0.6590686535244064,
-        "romanized": 0.6590686535244064,
-        "codemixed": 0.6590686535244064
+        "bangla": 0.6778184653086908,
+        "romanized": 0.6778184653086908,
+        "codemixed": 0.6778184653086908
       }
     }
   },
@@ -78,10 +156,17 @@
     "cache_dir": "D:\\BanglaNLP\\TrainingFree Pipeline\\cache",
     "views": "auto",
     "k": 25,
+    "k_max": 100,
     "lex_dim": 16384,
     "tau_lex": 0.05,
     "tau_dense": 0.02,
     "tau_llm": 0.05,
+    "no_knn_tuning": false,
+    "no_bias": false,
+    "no_propagation": false,
+    "graph_view": "auto",
+    "graph_k": 10,
+    "force_beta": null,
     "dense_model": "Qwen/Qwen3-Embedding-0.6B",
     "dense_instruction": "Identify the harmful intent and risk level of this user request",
     "no_instruction": false,
