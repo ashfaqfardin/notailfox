@@ -1,0 +1,107 @@
+{
+  "views": [
+    "lex"
+  ],
+  "systems": {
+    "fused": {
+      "cv": 0.6820384182966444,
+      "sd": 0.020285529461421144,
+      "dev_tuned": 0.6864819622137964,
+      "params": {
+        "wb": 1.0,
+        "a": [
+          1.0
+        ],
+        "t": 0.525,
+        "guard": false
+      }
+    }
+  },
+  "variants": {
+    "per-row argmax, no pooling": {
+      "defense": 0.6454791971472379,
+      "avg_f1": 0.6823492921329565,
+      "usr": 0.0540340488527017,
+      "f1": {
+        "bangla": 0.7037669658682792,
+        "romanized": 0.6926767779059864,
+        "codemixed": 0.6506041326246039
+      }
+    },
+    "mean pooling + argmax": {
+      "defense": 0.6719739496660656,
+      "avg_f1": 0.7004913626534371,
+      "usr": 0.04071058475203553,
+      "f1": {
+        "bangla": 0.7004913626534373,
+        "romanized": 0.7004913626534373,
+        "codemixed": 0.7004913626534373
+      }
+    },
+    "Bangla row copied + argmax": {
+      "defense": 0.6709488172008464,
+      "avg_f1": 0.7037669658682791,
+      "usr": 0.046632124352331605,
+      "f1": {
+        "bangla": 0.7037669658682792,
+        "romanized": 0.7037669658682792,
+        "codemixed": 0.7037669658682792
+      }
+    },
+    "tuned pooling + asymmetric rule (final)*": {
+      "defense": 0.6864819622137964,
+      "avg_f1": 0.6973211510908565,
+      "usr": 0.015544041450777202,
+      "f1": {
+        "bangla": 0.6973211510908565,
+        "romanized": 0.6973211510908565,
+        "codemixed": 0.6973211510908565
+      }
+    },
+    "final + EM prior shift (S4)*": {
+      "defense": 0.6522389265448788,
+      "avg_f1": 0.6590686535244064,
+      "usr": 0.010362694300518135,
+      "f1": {
+        "bangla": 0.6590686535244064,
+        "romanized": 0.6590686535244064,
+        "codemixed": 0.6590686535244064
+      }
+    }
+  },
+  "ood_cut": 0.1913817673921585,
+  "args": {
+    "mode": "dev",
+    "phase": "devtest",
+    "data_dir": "D:\\BanglaNLP\\TrainingFree Pipeline\\data",
+    "out_dir": "D:\\BanglaNLP\\TrainingFree Pipeline\\outputs",
+    "cache_dir": "D:\\BanglaNLP\\TrainingFree Pipeline\\cache",
+    "views": "auto",
+    "k": 25,
+    "lex_dim": 16384,
+    "tau_lex": 0.05,
+    "tau_dense": 0.02,
+    "tau_llm": 0.05,
+    "dense_model": "Qwen/Qwen3-Embedding-0.6B",
+    "dense_instruction": "Identify the harmful intent and risk level of this user request",
+    "no_instruction": false,
+    "dense_batch": 32,
+    "max_len": 512,
+    "llm_model": "Qwen/Qwen3-4B-Base",
+    "llm_layer": -1,
+    "llm_batch": 8,
+    "llm_max_text_tokens": 384,
+    "llm_forms": "bangla",
+    "guard_model": "",
+    "guard_strict": false,
+    "guard_batch": 16,
+    "prior_shift": "none",
+    "ood_view": "auto",
+    "ood_pct": 5.0,
+    "ood_delta": 0.1,
+    "a_step": 0.1,
+    "folds": 5,
+    "seed": 42,
+    "max_params": 7000000000.0
+  }
+}

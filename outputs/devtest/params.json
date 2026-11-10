@@ -1,0 +1,53 @@
+{
+  "views": [
+    "lex"
+  ],
+  "params": {
+    "wb": 1.0,
+    "a": [
+      1.0
+    ],
+    "t": 0.525,
+    "guard": false
+  },
+  "cv_defense": 0.6820384182966444,
+  "cv_sd": 0.020285529461421144,
+  "ood_cut": 0.1913817673921585,
+  "ood_view": "lex",
+  "phase": "devtest",
+  "args": {
+    "mode": "predict",
+    "phase": "devtest",
+    "data_dir": "D:\\BanglaNLP\\TrainingFree Pipeline\\data",
+    "out_dir": "D:\\BanglaNLP\\TrainingFree Pipeline\\outputs",
+    "cache_dir": "D:\\BanglaNLP\\TrainingFree Pipeline\\cache",
+    "views": "auto",
+    "k": 25,
+    "lex_dim": 16384,
+    "tau_lex": 0.05,
+    "tau_dense": 0.02,
+    "tau_llm": 0.05,
+    "dense_model": "Qwen/Qwen3-Embedding-0.6B",
+    "dense_instruction": "Identify the harmful intent and risk level of this user request",
+    "no_instruction": false,
+    "dense_batch": 32,
+    "max_len": 512,
+    "llm_model": "Qwen/Qwen3-4B-Base",
+    "llm_layer": -1,
+    "llm_batch": 8,
+    "llm_max_text_tokens": 384,
+    "llm_forms": "bangla",
+    "guard_model": "",
+    "guard_strict": false,
+    "guard_batch": 16,
+    "prior_shift": "none",
+    "ood_view": "auto",
+    "ood_pct": 5.0,
+    "ood_delta": 0.1,
+    "a_step": 0.1,
+    "folds": 5,
+    "seed": 42,
+    "max_params": 7000000000.0
+  },
+  "created": "2026-11-10 02:36:39"
+}
